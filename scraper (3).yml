@@ -1,0 +1,83 @@
+name: Netnaija Scraper
+
+on:
+  # Run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Scrape mode'
+        required: true
+        default: 'trending'
+        type: choice
+        options:
+          - trending
+          - search
+      keyword:
+        description: 'Search keyword (only used when mode=search)'
+        required: false
+        default: ''
+      subject_type:
+        description: 'Subject type (0=all, 1=movies, 2=series)'
+        required: false
+        default: '0'
+
+  # Run on a schedule — adjust cron as needed
+  schedule:
+    # Every 6 hours (scraper resumes from last state, so it will pick up where it left off)
+    - cron: '0 */6 * * *'
+
+  # Also run on pushes to main that modify the scraper
+  push:
+    branches: [main]
+    paths:
+      - 'scraper.py'
+      - '.github/workflows/scraper.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can commit & push
+          fetch-depth: 0
+          # Use the built-in GITHUB_TOKEN for checkout
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run scraper (trending)
+        if: github.event.inputs.mode == 'trending' || github.event.inputs.mode == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_USER_NAME: "github-actions[bot]"
+          GIT_USER_EMAIL: "github-actions[bot]@users.noreply.github.com"
+        run: python scraper.py trending
+
+      - name: Run scraper (search)
+        if: github.event.inputs.mode == 'search'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_USER_NAME: "github-actions[bot]"
+          GIT_USER_EMAIL: "github-actions[bot]@users.noreply.github.com"
+        run: |
+          python scraper.py search "${{ github.event.inputs.keyword }}" \
+            --per-page 24 \
+            --type ${{ github.event.inputs.subject_type }}
