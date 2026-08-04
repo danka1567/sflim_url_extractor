@@ -20,7 +20,6 @@ import os
 import subprocess
 import time
 import logging
-from datetime import datetime
 from typing import List
 
 import requests
@@ -63,8 +62,8 @@ MAX_PAGES           = 500
 COMMIT_EVERY        = 2
 MAX_FILE_SIZE       = 5 * 1024 * 1024  # 5 MB
 
-OUTPUT_DIR = "./output"
-STATE_FILE = os.path.join(OUTPUT_DIR, "page_state.json")
+OUTPUT_DIR    = "./output"
+STATE_FILE    = os.path.join(OUTPUT_DIR, "page_state.json")
 SEEN_IDS_FILE = os.path.join(OUTPUT_DIR, "seen_ids.json")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -138,7 +137,11 @@ def git_commit_and_push(message: str):
         for line in remotes.stdout.splitlines():
             if line.startswith("origin") and "(push)" in line:
                 url = line.split()[1]
-                if url.startswith("https://") and "x-access-token" not in url and "@" not in url[8:]:
+                if (
+                    url.startswith("https://")
+                    and "x-access-token" not in url
+                    and "@" not in url[8:]
+                ):
                     auth_url = f"https://x-access-token:{token}@{url[8:]}"
                     subprocess.run(
                         ["git", "remote", "set-url", "origin", auth_url], check=True
@@ -168,89 +171,140 @@ def save_state(state: dict):
 
 
 # ── ROLLING JSON FILE APPENDER ────────────────────────────────────────────────
+#
+# File naming: {prefix}_{index:03d}.json  — STABLE, no timestamp.
+# A single file grows until it hits 5 MB, then a new index is opened.
+# The OLD file is never modified once a new index starts.
 
-def _ts() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+def _filepath(prefix: str, file_index: int) -> str:
+    """Return the stable path for a given prefix + index (no timestamp)."""
+    return os.path.join(OUTPUT_DIR, f"{prefix}_{file_index:03d}.json")
 
 
-def _current_filepath(prefix: str, file_index: int) -> str:
-    return os.path.join(OUTPUT_DIR, f"{prefix}_{file_index:03d}_{_ts()}.json")
-
-
-def load_current_data(prefix: str, file_index: int) -> list:
-    """Find the most recent file matching prefix + index and load its data."""
-    pattern = f"{prefix}_{file_index:03d}_"
-    candidates = [
-        f for f in os.listdir(OUTPUT_DIR)
-        if f.startswith(pattern) and f.endswith(".json")
-    ]
-    if not candidates:
+def _load_file(filepath: str) -> list:
+    """Load JSON array from filepath; return [] if missing or corrupt."""
+    if not os.path.exists(filepath):
         return []
-    candidates.sort()
-    filepath = os.path.join(OUTPUT_DIR, candidates[-1])
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
+    except (json.JSONDecodeError, OSError):
         return []
 
 
-def write_file(filepath: str, data: list):
-    with open(filepath, "w", encoding="utf-8") as f:
+def _write_file(filepath: str, data: list):
+    """Atomically write a JSON array to filepath."""
+    tmp = filepath + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, filepath)  # atomic on POSIX; safe on Windows too
 
 
 def append_items(prefix: str, file_index: int, new_items: list) -> int:
     """
-    Append new_items to the current rolling JSON file.
-    If the file would exceed 5 MB, start a new file with the next index.
-    Returns the (possibly updated) file_index.
+    Append *unique* new_items to the current rolling file.
+    If the resulting file would exceed MAX_FILE_SIZE:
+      - keep the old file intact
+      - open the next index and write new_items there
+      - if new_items alone still exceed 5 MB, chunk across additional indices
+    Returns the (possibly incremented) file_index.
     """
     if not new_items:
         return file_index
 
-    existing = load_current_data(prefix, file_index)
-    combined = existing + new_items
-    filepath = _current_filepath(prefix, file_index)
-    write_file(filepath, combined)
+    filepath  = _filepath(prefix, file_index)
+    existing  = _load_file(filepath)
+    combined  = existing + new_items
+
+    _write_file(filepath, combined)
     size = os.path.getsize(filepath)
 
     if size <= MAX_FILE_SIZE:
-        log.info(f"💾  Appended {len(new_items)} items → {filepath} ({size/1024/1024:.2f} MB)")
+        log.info(
+            f"💾  Appended {len(new_items)} items → {filepath} "
+            f"({size / 1024 / 1024:.2f} MB, {len(combined)} total)"
+        )
         return file_index
 
-    # Exceeded 5 MB — restore old file, start new one with new items
+    # ── File exceeded 5 MB ────────────────────────────────────────────────────
     if existing:
-        write_file(filepath, existing)
-        log.info(f"💾  Kept {filepath} at {os.path.getsize(filepath)/1024/1024:.2f} MB")
+        # Restore old file to its previous state; put new_items in next file(s).
+        _write_file(filepath, existing)
+        log.info(
+            f"💾  {filepath} full "
+            f"({os.path.getsize(filepath) / 1024 / 1024:.2f} MB) — rolling over."
+        )
         file_index += 1
-        filepath = _current_filepath(prefix, file_index)
-        write_file(filepath, new_items)
-        size = os.path.getsize(filepath)
-        log.info(f"💾  New file → {filepath} ({size/1024/1024:.2f} MB)")
-        return file_index
+        # Fall through to chunk new_items starting at the new index.
+        items_to_write = new_items
     else:
-        # Even a single batch is > 5 MB — split it across files
+        # Even the very first batch is > 5 MB — we must chunk it.
         os.remove(filepath)
-        avg = size / len(combined)
-        chunk_size = max(1, int(MAX_FILE_SIZE / avg * 0.9))
-        idx = 0
-        while idx < len(combined):
-            chunk = combined[idx:idx + chunk_size]
-            filepath = _current_filepath(prefix, file_index)
-            write_file(filepath, chunk)
-            fsize = os.path.getsize(filepath)
-            log.info(f"💾  Chunk → {filepath} ({fsize/1024/1024:.2f} MB, {len(chunk)} items)")
-            idx += chunk_size
-            if idx < len(combined):
-                file_index += 1
-        return file_index
+        items_to_write = combined
+
+    # Write items_to_write across one or more new files.
+    while items_to_write:
+        fp    = _filepath(prefix, file_index)
+        prev  = _load_file(fp)          # may already have data if resuming mid-chunk
+
+        # Estimate how many items fit in the remaining space.
+        if prev:
+            # Pre-fill current file before estimating.
+            test  = prev + items_to_write
+            _write_file(fp, test)
+            sz    = os.path.getsize(fp)
+            if sz <= MAX_FILE_SIZE:
+                log.info(
+                    f"💾  {fp} ({sz / 1024 / 1024:.2f} MB, "
+                    f"{len(test)} items)"
+                )
+                items_to_write = []
+                break
+            # Overflowed — figure out the split point.
+            bytes_per_item = sz / len(test)
+            prev_size      = os.path.getsize(fp) if os.path.exists(fp) else 0
+            # Revert to prev content; calculate how many new items fit.
+            _write_file(fp, prev)
+            prev_size  = os.path.getsize(fp)
+            space_left = MAX_FILE_SIZE - prev_size
+            chunk_size = max(1, int(space_left / bytes_per_item * 0.95))
+            chunk      = items_to_write[:chunk_size]
+            _write_file(fp, prev + chunk)
+            log.info(
+                f"💾  {fp} ({os.path.getsize(fp) / 1024 / 1024:.2f} MB, "
+                f"{len(prev + chunk)} items)"
+            )
+            items_to_write = items_to_write[chunk_size:]
+            file_index    += 1
+        else:
+            # Empty new file — estimate from items_to_write size alone.
+            _write_file(fp, items_to_write)
+            sz = os.path.getsize(fp)
+            if sz <= MAX_FILE_SIZE:
+                log.info(
+                    f"💾  {fp} ({sz / 1024 / 1024:.2f} MB, "
+                    f"{len(items_to_write)} items)"
+                )
+                items_to_write = []
+                break
+            bytes_per_item = sz / len(items_to_write)
+            chunk_size     = max(1, int(MAX_FILE_SIZE / bytes_per_item * 0.95))
+            chunk          = items_to_write[:chunk_size]
+            _write_file(fp, chunk)
+            log.info(
+                f"💾  {fp} ({os.path.getsize(fp) / 1024 / 1024:.2f} MB, "
+                f"{len(chunk)} items)"
+            )
+            items_to_write = items_to_write[chunk_size:]
+            file_index    += 1
+
+    return file_index
 
 
 # ── API HELPERS ───────────────────────────────────────────────────────────────
 
 def _get(path: str, params: dict = None) -> dict:
-    url = f"{BASE_URL}{path}"
+    url  = f"{BASE_URL}{path}"
     resp = session.get(url, params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
@@ -260,7 +314,7 @@ def _get(path: str, params: dict = None) -> dict:
 
 
 def _post(path: str, body: dict) -> dict:
-    url = f"{BASE_URL}{path}"
+    url  = f"{BASE_URL}{path}"
     resp = session.post(url, json=body, timeout=30)
     resp.raise_for_status()
     data = resp.json()
@@ -293,18 +347,23 @@ def fetch_search_page(
 
 # ── CORE SCRAPER ──────────────────────────────────────────────────────────────
 
-def scrape_trending(start_page: int = 1, per_page: int = 18, file_index: int = 1) -> dict:
-    all_items = []
+def scrape_trending(
+    start_page: int = 1,
+    per_page: int = 18,
+    file_index: int = 1,
+) -> dict:
+    all_items  = []
+    dup_count  = 0
+    stop_reason = ""
+    seen_ids   = load_seen_ids()
+    prefix     = "trending"
+
     state = {
-        "next_page": start_page,
-        "mode": "trending",
-        "per_page": per_page,
+        "next_page":  start_page,
+        "mode":       "trending",
+        "per_page":   per_page,
         "file_index": file_index,
     }
-    stop_reason = ""
-    seen_ids = load_seen_ids()
-    dup_count = 0
-    prefix = "trending"
 
     for page in range(start_page, MAX_PAGES + 1):
         try:
@@ -327,24 +386,18 @@ def scrape_trending(start_page: int = 1, per_page: int = 18, file_index: int = 1
             log.info(f"🛑  Stopping: {stop_reason}")
             break
 
-        unique = deduplicate(subjects, seen_ids)
+        unique     = deduplicate(subjects, seen_ids)
         dup_count += len(subjects) - len(unique)
 
         if not unique:
-            log.info(f"  ⚠️  All {len(subjects)} items on page {page} were duplicates, continuing...")
-            state["next_page"] = page + 1
-            save_state(state)
-            save_seen_ids(seen_ids)
-            if not pager.get("hasMore"):
-                stop_reason = f"hasMore=False on page {page}"
-                log.info(f"🛑  Stopping: {stop_reason}")
-                break
-            time.sleep(DELAY_BETWEEN_PAGES)
-            continue
+            log.info(
+                f"  ⚠️  All {len(subjects)} items on page {page} were duplicates — continuing..."
+            )
+        else:
+            all_items.extend(unique)
+            file_index = append_items(prefix, file_index, unique)
 
-        all_items.extend(unique)
-        file_index = append_items(prefix, file_index, unique)
-        state["next_page"] = page + 1
+        state["next_page"]  = page + 1
         state["file_index"] = file_index
         save_state(state)
         save_seen_ids(seen_ids)
@@ -362,14 +415,17 @@ def scrape_trending(start_page: int = 1, per_page: int = 18, file_index: int = 1
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
-    if (state["next_page"] - 1) % COMMIT_EVERY != 0 and stop_reason:
+    # Final commit for any leftover pages.
+    if stop_reason and (state["next_page"] - 1) % COMMIT_EVERY != 0:
         git_commit_and_push(
             f"feat(scraper): trending final batch ending page {state['next_page'] - 1}"
         )
 
-    state["stop_reason"] = stop_reason
-    state["total_items"] = len(all_items)
-    state["duplicates_skipped"] = dup_count
+    state.update(
+        stop_reason=stop_reason,
+        total_items=len(all_items),
+        duplicates_skipped=dup_count,
+    )
     save_state(state)
     save_seen_ids(seen_ids)
     return state
@@ -382,25 +438,28 @@ def scrape_search(
     subject_type: int = SUBJECT_TYPE_ALL,
     file_index: int = 1,
 ) -> dict:
-    all_items = []
-    state = {
-        "next_page": start_page,
-        "mode": "search",
-        "keyword": keyword,
-        "per_page": per_page,
-        "subject_type": subject_type,
-        "file_index": file_index,
-    }
+    all_items   = []
+    dup_count   = 0
     stop_reason = ""
-    seen_ids = load_seen_ids()
-    dup_count = 0
-    prefix = f"search_{keyword.replace(' ', '_')[:30]}"
+    seen_ids    = load_seen_ids()
+    prefix      = f"search_{keyword.replace(' ', '_')[:30]}"
+
+    state = {
+        "next_page":    start_page,
+        "mode":         "search",
+        "keyword":      keyword,
+        "per_page":     per_page,
+        "subject_type": subject_type,
+        "file_index":   file_index,
+    }
 
     for page in range(start_page, MAX_PAGES + 1):
         try:
             data = fetch_search_page(
-                keyword=keyword, page=page,
-                per_page=per_page, subject_type=subject_type,
+                keyword=keyword,
+                page=page,
+                per_page=per_page,
+                subject_type=subject_type,
             )
         except Exception as exc:
             log.error(f"Error on page {page}: {exc}")
@@ -420,24 +479,18 @@ def scrape_search(
             log.info(f"🛑  Stopping: {stop_reason}")
             break
 
-        unique = deduplicate(items, seen_ids)
+        unique     = deduplicate(items, seen_ids)
         dup_count += len(items) - len(unique)
 
         if not unique:
-            log.info(f"  ⚠️  All {len(items)} items on page {page} were duplicates, continuing...")
-            state["next_page"] = page + 1
-            save_state(state)
-            save_seen_ids(seen_ids)
-            if not pager.get("hasMore"):
-                stop_reason = f"hasMore=False on page {page}"
-                log.info(f"🛑  Stopping: {stop_reason}")
-                break
-            time.sleep(DELAY_BETWEEN_PAGES)
-            continue
+            log.info(
+                f"  ⚠️  All {len(items)} items on page {page} were duplicates — continuing..."
+            )
+        else:
+            all_items.extend(unique)
+            file_index = append_items(prefix, file_index, unique)
 
-        all_items.extend(unique)
-        file_index = append_items(prefix, file_index, unique)
-        state["next_page"] = page + 1
+        state["next_page"]  = page + 1
         state["file_index"] = file_index
         save_state(state)
         save_seen_ids(seen_ids)
@@ -455,14 +508,16 @@ def scrape_search(
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
-    if (state["next_page"] - 1) % COMMIT_EVERY != 0 and stop_reason:
+    if stop_reason and (state["next_page"] - 1) % COMMIT_EVERY != 0:
         git_commit_and_push(
-            f"feat(scraper): search final batch ending page {state['next_page'] - 1}"
+            f"feat(scraper): search '{keyword}' final batch ending page {state['next_page'] - 1}"
         )
 
-    state["stop_reason"] = stop_reason
-    state["total_items"] = len(all_items)
-    state["duplicates_skipped"] = dup_count
+    state.update(
+        stop_reason=stop_reason,
+        total_items=len(all_items),
+        duplicates_skipped=dup_count,
+    )
     save_state(state)
     save_seen_ids(seen_ids)
     return state
@@ -490,21 +545,22 @@ def main():
     args = parser.parse_args()
     git_config()
 
-    state = load_state()
+    state      = load_state()
     start_page = state.get("next_page", 1)
     file_index = state.get("file_index", 1)
 
     if args.cmd == "trending":
-        log.info(f"=== Starting trending scrape from page {start_page}, file index {file_index} ===")
-        final = scrape_trending(start_page=start_page, file_index=file_index)
         log.info(
-            f"✅  Done. Total unique: {final['total_items']}, "
-            f"dups skipped: {final.get('duplicates_skipped', 0)}, "
-            f"reason: {final['stop_reason']}"
+            f"=== Starting trending scrape from page {start_page}, "
+            f"file index {file_index} ==="
         )
+        final = scrape_trending(start_page=start_page, file_index=file_index)
 
     elif args.cmd == "search":
-        log.info(f"=== Starting search '{args.keyword}' from page {start_page}, file index {file_index} ===")
+        log.info(
+            f"=== Starting search '{args.keyword}' from page {start_page}, "
+            f"file index {file_index} ==="
+        )
         final = scrape_search(
             keyword=args.keyword,
             start_page=start_page,
@@ -512,20 +568,20 @@ def main():
             subject_type=args.subject_type,
             file_index=file_index,
         )
-        log.info(
-            f"✅  Done. Total unique: {final['total_items']}, "
-            f"dups skipped: {final.get('duplicates_skipped', 0)}, "
-            f"reason: {final['stop_reason']}"
-        )
 
     else:
-        log.info(f"=== Starting trending scrape from page {start_page}, file index {file_index} ===")
-        final = scrape_trending(start_page=start_page, file_index=file_index)
+        # Default: trending
         log.info(
-            f"✅  Done. Total unique: {final['total_items']}, "
-            f"dups skipped: {final.get('duplicates_skipped', 0)}, "
-            f"reason: {final['stop_reason']}"
+            f"=== Starting trending scrape from page {start_page}, "
+            f"file index {file_index} ==="
         )
+        final = scrape_trending(start_page=start_page, file_index=file_index)
+
+    log.info(
+        f"✅  Done. Total unique: {final['total_items']}, "
+        f"dups skipped: {final.get('duplicates_skipped', 0)}, "
+        f"reason: {final['stop_reason']}"
+    )
 
 
 if __name__ == "__main__":
