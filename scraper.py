@@ -5,9 +5,9 @@ Netnaija API Scraper — GitHub Action Edition
 - Resumes from last saved state (page number stored in page_state.json)
 - Commits & pushes after every 2 pages using built-in GITHUB_TOKEN
 - Stops automatically when no more data (hasMore=False or empty items)
-- Auto-splits JSON files when they exceed 5 MB
-- Deduplicates items globally (no duplicates across any output file)
-- Saves incremental JSON files to ./output/
+- Appends data into a single rolling JSON file; creates next file when 5 MB reached
+- Global deduplication across all runs (no duplicates ever saved)
+- Saves JSON files to ./output/
 
 Environment variables (auto-set by GitHub Actions):
   GITHUB_TOKEN      — Built-in GitHub token for repo write access
@@ -18,11 +18,10 @@ Environment variables (auto-set by GitHub Actions):
 import json
 import os
 import subprocess
-import sys
 import time
 import logging
 from datetime import datetime
-from typing import Generator, Optional, List
+from typing import List
 
 import requests
 
@@ -79,19 +78,16 @@ log = logging.getLogger(__name__)
 session = requests.Session()
 session.headers.update(HEADERS)
 
-# ── DEDUPLICATION HELPERS ─────────────────────────────────────────────────────
+# ── DEDUPLICATION ─────────────────────────────────────────────────────────────
 
 def get_item_id(item: dict) -> str:
-    """Extract a unique identifier from an item for deduplication."""
     for key in ("id", "subjectId", "sid", "uid"):
         if key in item and item[key] is not None:
             return str(item[key])
-    # Fallback: hash the entire item
     return str(hash(json.dumps(item, sort_keys=True, ensure_ascii=False)))
 
 
 def load_seen_ids() -> set:
-    """Load previously seen item IDs from disk."""
     if os.path.exists(SEEN_IDS_FILE):
         with open(SEEN_IDS_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
@@ -99,15 +95,23 @@ def load_seen_ids() -> set:
 
 
 def save_seen_ids(seen: set):
-    """Persist seen item IDs to disk."""
     with open(SEEN_IDS_FILE, "w", encoding="utf-8") as f:
         json.dump(list(seen), f)
+
+
+def deduplicate(items: list, seen_ids: set) -> list:
+    unique = []
+    for item in items:
+        item_id = get_item_id(item)
+        if item_id not in seen_ids:
+            seen_ids.add(item_id)
+            unique.append(item)
+    return unique
 
 
 # ── GIT HELPERS ───────────────────────────────────────────────────────────────
 
 def git_config():
-    """Set git user name/email from env."""
     name  = os.environ.get("GIT_USER_NAME", "GitHub Action")
     email = os.environ.get("GIT_USER_EMAIL", "action@github.com")
     subprocess.run(["git", "config", "user.name", name], check=True)
@@ -115,7 +119,6 @@ def git_config():
 
 
 def git_commit_and_push(message: str):
-    """Stage output/, commit, and push using built-in GITHUB_TOKEN."""
     log.info(f"📦  Git commit: {message}")
     subprocess.run(["git", "add", OUTPUT_DIR], check=False)
     result = subprocess.run(
@@ -151,7 +154,12 @@ def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"next_page": 1, "mode": "trending", "per_page": 18}
+    return {
+        "next_page": 1,
+        "mode": "trending",
+        "per_page": 18,
+        "file_index": 1,
+    }
 
 
 def save_state(state: dict):
@@ -159,66 +167,84 @@ def save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-# ── JSON OUTPUT HELPERS (with auto-split & dedup) ────────────────────────────
+# ── ROLLING JSON FILE APPENDER ────────────────────────────────────────────────
 
-def _timestamp() -> str:
+def _ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def save_json_split(data: list, filename_base: str, max_size: int = MAX_FILE_SIZE) -> List[str]:
-    """
-    Save data as JSON, auto-splitting into multiple files if size exceeds max_size.
-    Returns list of saved file paths.
-    """
-    if not data:
+def _current_filepath(prefix: str, file_index: int) -> str:
+    return os.path.join(OUTPUT_DIR, f"{prefix}_{file_index:03d}_{_ts()}.json")
+
+
+def load_current_data(prefix: str, file_index: int) -> list:
+    """Find the most recent file matching prefix + index and load its data."""
+    pattern = f"{prefix}_{file_index:03d}_"
+    candidates = [
+        f for f in os.listdir(OUTPUT_DIR)
+        if f.startswith(pattern) and f.endswith(".json")
+    ]
+    if not candidates:
+        return []
+    candidates.sort()
+    filepath = os.path.join(OUTPUT_DIR, candidates[-1])
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
         return []
 
-    filepath = os.path.join(OUTPUT_DIR, filename_base)
+
+def write_file(filepath: str, data: list):
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+
+def append_items(prefix: str, file_index: int, new_items: list) -> int:
+    """
+    Append new_items to the current rolling JSON file.
+    If the file would exceed 5 MB, start a new file with the next index.
+    Returns the (possibly updated) file_index.
+    """
+    if not new_items:
+        return file_index
+
+    existing = load_current_data(prefix, file_index)
+    combined = existing + new_items
+    filepath = _current_filepath(prefix, file_index)
+    write_file(filepath, combined)
     size = os.path.getsize(filepath)
-    if size <= max_size:
-        log.info(f"💾  Saved → {filepath} ({size/1024/1024:.2f} MB)")
-        return [filepath]
 
-    # Too big — split into chunks
-    os.remove(filepath)
-    files = []
-    total = len(data)
-    avg_size = size / total
-    items_per_chunk = max(1, int(max_size / avg_size * 0.9))
+    if size <= MAX_FILE_SIZE:
+        log.info(f"💾  Appended {len(new_items)} items → {filepath} ({size/1024/1024:.2f} MB)")
+        return file_index
 
-    for i in range(0, total, items_per_chunk):
-        chunk = data[i:i + items_per_chunk]
-        if i == 0:
-            chunk_path = filepath
-        else:
-            name, ext = os.path.splitext(filename_base)
-            part_num = i // items_per_chunk + 1
-            chunk_path = os.path.join(OUTPUT_DIR, f"{name}_part{part_num}{ext}")
-
-        with open(chunk_path, "w", encoding="utf-8") as f:
-            json.dump(chunk, f, indent=2, ensure_ascii=False)
-
-        chunk_size = os.path.getsize(chunk_path)
-        files.append(chunk_path)
-        log.info(f"💾  Saved → {chunk_path} ({chunk_size/1024/1024:.2f} MB)")
-
-    return files
-
-
-def deduplicate_items(items: list, seen_ids: set) -> list:
-    """Filter out items whose IDs are already in seen_ids. Returns only new unique items."""
-    unique = []
-    for item in items:
-        item_id = get_item_id(item)
-        if item_id in seen_ids:
-            log.debug(f"  ⚠️  Duplicate skipped: {item.get('title', item_id)}")
-            continue
-        seen_ids.add(item_id)
-        unique.append(item)
-    return unique
+    # Exceeded 5 MB — restore old file, start new one with new items
+    if existing:
+        write_file(filepath, existing)
+        log.info(f"💾  Kept {filepath} at {os.path.getsize(filepath)/1024/1024:.2f} MB")
+        file_index += 1
+        filepath = _current_filepath(prefix, file_index)
+        write_file(filepath, new_items)
+        size = os.path.getsize(filepath)
+        log.info(f"💾  New file → {filepath} ({size/1024/1024:.2f} MB)")
+        return file_index
+    else:
+        # Even a single batch is > 5 MB — split it across files
+        os.remove(filepath)
+        avg = size / len(combined)
+        chunk_size = max(1, int(MAX_FILE_SIZE / avg * 0.9))
+        idx = 0
+        while idx < len(combined):
+            chunk = combined[idx:idx + chunk_size]
+            filepath = _current_filepath(prefix, file_index)
+            write_file(filepath, chunk)
+            fsize = os.path.getsize(filepath)
+            log.info(f"💾  Chunk → {filepath} ({fsize/1024/1024:.2f} MB, {len(chunk)} items)")
+            idx += chunk_size
+            if idx < len(combined):
+                file_index += 1
+        return file_index
 
 
 # ── API HELPERS ───────────────────────────────────────────────────────────────
@@ -242,8 +268,6 @@ def _post(path: str, body: dict) -> dict:
         raise RuntimeError(f"API error {data.get('code')}: {data.get('message')}")
     return data["data"]
 
-
-# ── ENDPOINT WRAPPERS ─────────────────────────────────────────────────────────
 
 def fetch_trending_page(page: int = 1, per_page: int = 18, uid: str = "") -> dict:
     params = {"uid": uid, "page": page, "perPage": per_page}
@@ -269,12 +293,18 @@ def fetch_search_page(
 
 # ── CORE SCRAPER ──────────────────────────────────────────────────────────────
 
-def scrape_trending(start_page: int = 1, per_page: int = 18) -> dict:
+def scrape_trending(start_page: int = 1, per_page: int = 18, file_index: int = 1) -> dict:
     all_items = []
-    state = {"next_page": start_page, "mode": "trending", "per_page": per_page}
+    state = {
+        "next_page": start_page,
+        "mode": "trending",
+        "per_page": per_page,
+        "file_index": file_index,
+    }
     stop_reason = ""
     seen_ids = load_seen_ids()
     dup_count = 0
+    prefix = "trending"
 
     for page in range(start_page, MAX_PAGES + 1):
         try:
@@ -297,14 +327,11 @@ def scrape_trending(start_page: int = 1, per_page: int = 18) -> dict:
             log.info(f"🛑  Stopping: {stop_reason}")
             break
 
-        # Deduplicate
-        unique_subjects = deduplicate_items(subjects, seen_ids)
-        dup_count += len(subjects) - len(unique_subjects)
-        if dup_count > 0:
-            log.info(f"  🔄  Duplicates skipped so far: {dup_count}")
+        unique = deduplicate(subjects, seen_ids)
+        dup_count += len(subjects) - len(unique)
 
-        if not unique_subjects:
-            log.info(f"  ⚠️  All items on page {page} were duplicates, continuing...")
+        if not unique:
+            log.info(f"  ⚠️  All {len(subjects)} items on page {page} were duplicates, continuing...")
             state["next_page"] = page + 1
             save_state(state)
             save_seen_ids(seen_ids)
@@ -315,20 +342,17 @@ def scrape_trending(start_page: int = 1, per_page: int = 18) -> dict:
             time.sleep(DELAY_BETWEEN_PAGES)
             continue
 
-        all_items.extend(unique_subjects)
+        all_items.extend(unique)
+        file_index = append_items(prefix, file_index, unique)
         state["next_page"] = page + 1
+        state["file_index"] = file_index
         save_state(state)
         save_seen_ids(seen_ids)
 
-        # Save incremental batch (auto-split if > 5 MB)
-        batch_file = f"trending_page_{page:04d}_{_timestamp()}.json"
-        save_json_split(unique_subjects, batch_file)
-
-        # Commit & push every COMMIT_EVERY pages
         if page % COMMIT_EVERY == 0:
             git_commit_and_push(
                 f"feat(scraper): trending pages {page - COMMIT_EVERY + 1}–{page} "
-                f"({len(all_items)} unique items so far, {dup_count} dups skipped)"
+                f"({len(all_items)} unique, {dup_count} dups)"
             )
 
         if not pager.get("hasMore"):
@@ -338,16 +362,10 @@ def scrape_trending(start_page: int = 1, per_page: int = 18) -> dict:
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
-    # Final commit if there are uncommitted pages
     if (state["next_page"] - 1) % COMMIT_EVERY != 0 and stop_reason:
         git_commit_and_push(
             f"feat(scraper): trending final batch ending page {state['next_page'] - 1}"
         )
-
-    # Save full cumulative dump (auto-split if > 5 MB)
-    if all_items:
-        save_json_split(all_items, f"trending_all_{_timestamp()}.json")
-        git_commit_and_push("feat(scraper): final cumulative trending dump")
 
     state["stop_reason"] = stop_reason
     state["total_items"] = len(all_items)
@@ -362,6 +380,7 @@ def scrape_search(
     start_page: int = 1,
     per_page: int = 24,
     subject_type: int = SUBJECT_TYPE_ALL,
+    file_index: int = 1,
 ) -> dict:
     all_items = []
     state = {
@@ -370,10 +389,12 @@ def scrape_search(
         "keyword": keyword,
         "per_page": per_page,
         "subject_type": subject_type,
+        "file_index": file_index,
     }
     stop_reason = ""
     seen_ids = load_seen_ids()
     dup_count = 0
+    prefix = f"search_{keyword.replace(' ', '_')[:30]}"
 
     for page in range(start_page, MAX_PAGES + 1):
         try:
@@ -399,14 +420,11 @@ def scrape_search(
             log.info(f"🛑  Stopping: {stop_reason}")
             break
 
-        # Deduplicate
-        unique_items = deduplicate_items(items, seen_ids)
-        dup_count += len(items) - len(unique_items)
-        if dup_count > 0:
-            log.info(f"  🔄  Duplicates skipped so far: {dup_count}")
+        unique = deduplicate(items, seen_ids)
+        dup_count += len(items) - len(unique)
 
-        if not unique_items:
-            log.info(f"  ⚠️  All items on page {page} were duplicates, continuing...")
+        if not unique:
+            log.info(f"  ⚠️  All {len(items)} items on page {page} were duplicates, continuing...")
             state["next_page"] = page + 1
             save_state(state)
             save_seen_ids(seen_ids)
@@ -417,18 +435,17 @@ def scrape_search(
             time.sleep(DELAY_BETWEEN_PAGES)
             continue
 
-        all_items.extend(unique_items)
+        all_items.extend(unique)
+        file_index = append_items(prefix, file_index, unique)
         state["next_page"] = page + 1
+        state["file_index"] = file_index
         save_state(state)
         save_seen_ids(seen_ids)
-
-        batch_file = f"search_{keyword.replace(' ', '_')[:30]}_page_{page:04d}_{_timestamp()}.json"
-        save_json_split(unique_items, batch_file)
 
         if page % COMMIT_EVERY == 0:
             git_commit_and_push(
                 f"feat(scraper): search '{keyword}' pages {page - COMMIT_EVERY + 1}–{page} "
-                f"({len(all_items)} unique items so far, {dup_count} dups skipped)"
+                f"({len(all_items)} unique, {dup_count} dups)"
             )
 
         if not pager.get("hasMore"):
@@ -442,10 +459,6 @@ def scrape_search(
         git_commit_and_push(
             f"feat(scraper): search final batch ending page {state['next_page'] - 1}"
         )
-
-    if all_items:
-        save_json_split(all_items, f"search_{keyword.replace(' ', '_')[:30]}_all_{_timestamp()}.json")
-        git_commit_and_push("feat(scraper): final cumulative search dump")
 
     state["stop_reason"] = stop_reason
     state["total_items"] = len(all_items)
@@ -479,10 +492,11 @@ def main():
 
     state = load_state()
     start_page = state.get("next_page", 1)
+    file_index = state.get("file_index", 1)
 
     if args.cmd == "trending":
-        log.info(f"=== Starting trending scrape from page {start_page} ===")
-        final = scrape_trending(start_page=start_page)
+        log.info(f"=== Starting trending scrape from page {start_page}, file index {file_index} ===")
+        final = scrape_trending(start_page=start_page, file_index=file_index)
         log.info(
             f"✅  Done. Total unique: {final['total_items']}, "
             f"dups skipped: {final.get('duplicates_skipped', 0)}, "
@@ -490,12 +504,13 @@ def main():
         )
 
     elif args.cmd == "search":
-        log.info(f"=== Starting search '{args.keyword}' from page {start_page} ===")
+        log.info(f"=== Starting search '{args.keyword}' from page {start_page}, file index {file_index} ===")
         final = scrape_search(
             keyword=args.keyword,
             start_page=start_page,
             per_page=args.per_page,
             subject_type=args.subject_type,
+            file_index=file_index,
         )
         log.info(
             f"✅  Done. Total unique: {final['total_items']}, "
@@ -504,8 +519,8 @@ def main():
         )
 
     else:
-        log.info(f"=== Starting trending scrape from page {start_page} ===")
-        final = scrape_trending(start_page=start_page)
+        log.info(f"=== Starting trending scrape from page {start_page}, file index {file_index} ===")
+        final = scrape_trending(start_page=start_page, file_index=file_index)
         log.info(
             f"✅  Done. Total unique: {final['total_items']}, "
             f"dups skipped: {final.get('duplicates_skipped', 0)}, "
