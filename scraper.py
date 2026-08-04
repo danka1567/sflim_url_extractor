@@ -108,8 +108,9 @@ def git_commit_and_push(message: str):
         for line in remotes.stdout.splitlines():
             if line.startswith("origin") and "(push)" in line:
                 url = line.split()[1]
-                # Convert HTTPS URL to token-authenticated URL
-                if url.startswith("https://"):
+                # Only modify if URL is plain HTTPS (no auth embedded yet)
+                # If already has x-access-token or @ after https://, skip
+                if url.startswith("https://") and "x-access-token" not in url and "@" not in url[8:]:
                     auth_url = f"https://x-access-token:{token}@{url[8:]}"
                     subprocess.run(
                         ["git", "remote", "set-url", "origin", auth_url], check=True
