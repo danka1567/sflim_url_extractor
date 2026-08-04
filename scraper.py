@@ -5,6 +5,8 @@ Netnaija API Scraper — GitHub Action Edition
 - Resumes from last saved state (page number stored in page_state.json)
 - Commits & pushes after every 2 pages using built-in GITHUB_TOKEN
 - Stops automatically when no more data (hasMore=False or empty items)
+- Auto-splits JSON files when they exceed 5 MB
+- Deduplicates items globally (no duplicates across any output file)
 - Saves incremental JSON files to ./output/
 
 Environment variables (auto-set by GitHub Actions):
@@ -20,7 +22,7 @@ import sys
 import time
 import logging
 from datetime import datetime
-from typing import Generator, Optional
+from typing import Generator, Optional, List
 
 import requests
 
@@ -57,12 +59,14 @@ SUBJECT_TYPE_ALL    = 0
 SUBJECT_TYPE_MOVIE  = 1
 SUBJECT_TYPE_SERIES = 2
 
-DELAY_BETWEEN_PAGES = 1.0   # polite crawl delay
-MAX_PAGES           = 500   # hard safety limit
-COMMIT_EVERY        = 2     # commit & push every N pages
+DELAY_BETWEEN_PAGES = 1.0
+MAX_PAGES           = 500
+COMMIT_EVERY        = 2
+MAX_FILE_SIZE       = 5 * 1024 * 1024  # 5 MB
 
 OUTPUT_DIR = "./output"
 STATE_FILE = os.path.join(OUTPUT_DIR, "page_state.json")
+SEEN_IDS_FILE = os.path.join(OUTPUT_DIR, "seen_ids.json")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -74,6 +78,31 @@ log = logging.getLogger(__name__)
 
 session = requests.Session()
 session.headers.update(HEADERS)
+
+# ── DEDUPLICATION HELPERS ─────────────────────────────────────────────────────
+
+def get_item_id(item: dict) -> str:
+    """Extract a unique identifier from an item for deduplication."""
+    for key in ("id", "subjectId", "sid", "uid"):
+        if key in item and item[key] is not None:
+            return str(item[key])
+    # Fallback: hash the entire item
+    return str(hash(json.dumps(item, sort_keys=True, ensure_ascii=False)))
+
+
+def load_seen_ids() -> set:
+    """Load previously seen item IDs from disk."""
+    if os.path.exists(SEEN_IDS_FILE):
+        with open(SEEN_IDS_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_seen_ids(seen: set):
+    """Persist seen item IDs to disk."""
+    with open(SEEN_IDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(seen), f)
+
 
 # ── GIT HELPERS ───────────────────────────────────────────────────────────────
 
@@ -89,7 +118,6 @@ def git_commit_and_push(message: str):
     """Stage output/, commit, and push using built-in GITHUB_TOKEN."""
     log.info(f"📦  Git commit: {message}")
     subprocess.run(["git", "add", OUTPUT_DIR], check=False)
-    # Check if there is anything to commit
     result = subprocess.run(
         ["git", "diff", "--cached", "--quiet"],
         capture_output=True,
@@ -99,7 +127,6 @@ def git_commit_and_push(message: str):
         return
     subprocess.run(["git", "commit", "-m", message], check=True)
 
-    # Use built-in GITHUB_TOKEN for push
     token = os.environ.get("GITHUB_TOKEN", "")
     if token:
         remotes = subprocess.run(
@@ -108,8 +135,6 @@ def git_commit_and_push(message: str):
         for line in remotes.stdout.splitlines():
             if line.startswith("origin") and "(push)" in line:
                 url = line.split()[1]
-                # Only modify if URL is plain HTTPS (no auth embedded yet)
-                # If already has x-access-token or @ after https://, skip
                 if url.startswith("https://") and "x-access-token" not in url and "@" not in url[8:]:
                     auth_url = f"https://x-access-token:{token}@{url[8:]}"
                     subprocess.run(
@@ -123,7 +148,6 @@ def git_commit_and_push(message: str):
 # ── STATE HELPERS ─────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    """Load resume state. Returns {'next_page': 1, 'mode': 'trending'} if missing."""
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -131,23 +155,70 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    """Persist resume state."""
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 
-# ── JSON OUTPUT HELPERS ───────────────────────────────────────────────────────
+# ── JSON OUTPUT HELPERS (with auto-split & dedup) ────────────────────────────
 
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def save_json(data: object, filename: str) -> str:
-    filepath = os.path.join(OUTPUT_DIR, filename)
+def save_json_split(data: list, filename_base: str, max_size: int = MAX_FILE_SIZE) -> List[str]:
+    """
+    Save data as JSON, auto-splitting into multiple files if size exceeds max_size.
+    Returns list of saved file paths.
+    """
+    if not data:
+        return []
+
+    filepath = os.path.join(OUTPUT_DIR, filename_base)
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    log.info(f"💾  Saved → {filepath}")
-    return filepath
+
+    size = os.path.getsize(filepath)
+    if size <= max_size:
+        log.info(f"💾  Saved → {filepath} ({size/1024/1024:.2f} MB)")
+        return [filepath]
+
+    # Too big — split into chunks
+    os.remove(filepath)
+    files = []
+    total = len(data)
+    avg_size = size / total
+    items_per_chunk = max(1, int(max_size / avg_size * 0.9))
+
+    for i in range(0, total, items_per_chunk):
+        chunk = data[i:i + items_per_chunk]
+        if i == 0:
+            chunk_path = filepath
+        else:
+            name, ext = os.path.splitext(filename_base)
+            part_num = i // items_per_chunk + 1
+            chunk_path = os.path.join(OUTPUT_DIR, f"{name}_part{part_num}{ext}")
+
+        with open(chunk_path, "w", encoding="utf-8") as f:
+            json.dump(chunk, f, indent=2, ensure_ascii=False)
+
+        chunk_size = os.path.getsize(chunk_path)
+        files.append(chunk_path)
+        log.info(f"💾  Saved → {chunk_path} ({chunk_size/1024/1024:.2f} MB)")
+
+    return files
+
+
+def deduplicate_items(items: list, seen_ids: set) -> list:
+    """Filter out items whose IDs are already in seen_ids. Returns only new unique items."""
+    unique = []
+    for item in items:
+        item_id = get_item_id(item)
+        if item_id in seen_ids:
+            log.debug(f"  ⚠️  Duplicate skipped: {item.get('title', item_id)}")
+            continue
+        seen_ids.add(item_id)
+        unique.append(item)
+    return unique
 
 
 # ── API HELPERS ───────────────────────────────────────────────────────────────
@@ -199,15 +270,11 @@ def fetch_search_page(
 # ── CORE SCRAPER ──────────────────────────────────────────────────────────────
 
 def scrape_trending(start_page: int = 1, per_page: int = 18) -> dict:
-    """
-    Scrape trending pages starting from start_page.
-    Commits & pushes every COMMIT_EVERY pages.
-    Stops when hasMore=False or items are empty.
-    Returns final state dict.
-    """
     all_items = []
     state = {"next_page": start_page, "mode": "trending", "per_page": per_page}
     stop_reason = ""
+    seen_ids = load_seen_ids()
+    dup_count = 0
 
     for page in range(start_page, MAX_PAGES + 1):
         try:
@@ -230,19 +297,38 @@ def scrape_trending(start_page: int = 1, per_page: int = 18) -> dict:
             log.info(f"🛑  Stopping: {stop_reason}")
             break
 
-        all_items.extend(subjects)
+        # Deduplicate
+        unique_subjects = deduplicate_items(subjects, seen_ids)
+        dup_count += len(subjects) - len(unique_subjects)
+        if dup_count > 0:
+            log.info(f"  🔄  Duplicates skipped so far: {dup_count}")
+
+        if not unique_subjects:
+            log.info(f"  ⚠️  All items on page {page} were duplicates, continuing...")
+            state["next_page"] = page + 1
+            save_state(state)
+            save_seen_ids(seen_ids)
+            if not pager.get("hasMore"):
+                stop_reason = f"hasMore=False on page {page}"
+                log.info(f"🛑  Stopping: {stop_reason}")
+                break
+            time.sleep(DELAY_BETWEEN_PAGES)
+            continue
+
+        all_items.extend(unique_subjects)
         state["next_page"] = page + 1
         save_state(state)
+        save_seen_ids(seen_ids)
 
-        # Save incremental batch
+        # Save incremental batch (auto-split if > 5 MB)
         batch_file = f"trending_page_{page:04d}_{_timestamp()}.json"
-        save_json(subjects, batch_file)
+        save_json_split(unique_subjects, batch_file)
 
         # Commit & push every COMMIT_EVERY pages
         if page % COMMIT_EVERY == 0:
             git_commit_and_push(
                 f"feat(scraper): trending pages {page - COMMIT_EVERY + 1}–{page} "
-                f"({len(all_items)} total items so far)"
+                f"({len(all_items)} unique items so far, {dup_count} dups skipped)"
             )
 
         if not pager.get("hasMore"):
@@ -258,14 +344,16 @@ def scrape_trending(start_page: int = 1, per_page: int = 18) -> dict:
             f"feat(scraper): trending final batch ending page {state['next_page'] - 1}"
         )
 
-    # Save full cumulative dump
+    # Save full cumulative dump (auto-split if > 5 MB)
     if all_items:
-        save_json(all_items, f"trending_all_{_timestamp()}.json")
+        save_json_split(all_items, f"trending_all_{_timestamp()}.json")
         git_commit_and_push("feat(scraper): final cumulative trending dump")
 
     state["stop_reason"] = stop_reason
     state["total_items"] = len(all_items)
+    state["duplicates_skipped"] = dup_count
     save_state(state)
+    save_seen_ids(seen_ids)
     return state
 
 
@@ -275,11 +363,6 @@ def scrape_search(
     per_page: int = 24,
     subject_type: int = SUBJECT_TYPE_ALL,
 ) -> dict:
-    """
-    Scrape search results starting from start_page.
-    Commits & pushes every COMMIT_EVERY pages.
-    Stops when hasMore=False or items are empty.
-    """
     all_items = []
     state = {
         "next_page": start_page,
@@ -289,6 +372,8 @@ def scrape_search(
         "subject_type": subject_type,
     }
     stop_reason = ""
+    seen_ids = load_seen_ids()
+    dup_count = 0
 
     for page in range(start_page, MAX_PAGES + 1):
         try:
@@ -314,17 +399,36 @@ def scrape_search(
             log.info(f"🛑  Stopping: {stop_reason}")
             break
 
-        all_items.extend(items)
+        # Deduplicate
+        unique_items = deduplicate_items(items, seen_ids)
+        dup_count += len(items) - len(unique_items)
+        if dup_count > 0:
+            log.info(f"  🔄  Duplicates skipped so far: {dup_count}")
+
+        if not unique_items:
+            log.info(f"  ⚠️  All items on page {page} were duplicates, continuing...")
+            state["next_page"] = page + 1
+            save_state(state)
+            save_seen_ids(seen_ids)
+            if not pager.get("hasMore"):
+                stop_reason = f"hasMore=False on page {page}"
+                log.info(f"🛑  Stopping: {stop_reason}")
+                break
+            time.sleep(DELAY_BETWEEN_PAGES)
+            continue
+
+        all_items.extend(unique_items)
         state["next_page"] = page + 1
         save_state(state)
+        save_seen_ids(seen_ids)
 
         batch_file = f"search_{keyword.replace(' ', '_')[:30]}_page_{page:04d}_{_timestamp()}.json"
-        save_json(items, batch_file)
+        save_json_split(unique_items, batch_file)
 
         if page % COMMIT_EVERY == 0:
             git_commit_and_push(
                 f"feat(scraper): search '{keyword}' pages {page - COMMIT_EVERY + 1}–{page} "
-                f"({len(all_items)} total items so far)"
+                f"({len(all_items)} unique items so far, {dup_count} dups skipped)"
             )
 
         if not pager.get("hasMore"):
@@ -340,12 +444,14 @@ def scrape_search(
         )
 
     if all_items:
-        save_json(all_items, f"search_{keyword.replace(' ', '_')[:30]}_all_{_timestamp()}.json")
+        save_json_split(all_items, f"search_{keyword.replace(' ', '_')[:30]}_all_{_timestamp()}.json")
         git_commit_and_push("feat(scraper): final cumulative search dump")
 
     state["stop_reason"] = stop_reason
     state["total_items"] = len(all_items)
+    state["duplicates_skipped"] = dup_count
     save_state(state)
+    save_seen_ids(seen_ids)
     return state
 
 
@@ -369,8 +475,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    # Configure git once
     git_config()
 
     state = load_state()
@@ -379,7 +483,11 @@ def main():
     if args.cmd == "trending":
         log.info(f"=== Starting trending scrape from page {start_page} ===")
         final = scrape_trending(start_page=start_page)
-        log.info(f"✅  Done. Total items: {final['total_items']}. Reason: {final['stop_reason']}")
+        log.info(
+            f"✅  Done. Total unique: {final['total_items']}, "
+            f"dups skipped: {final.get('duplicates_skipped', 0)}, "
+            f"reason: {final['stop_reason']}"
+        )
 
     elif args.cmd == "search":
         log.info(f"=== Starting search '{args.keyword}' from page {start_page} ===")
@@ -389,13 +497,20 @@ def main():
             per_page=args.per_page,
             subject_type=args.subject_type,
         )
-        log.info(f"✅  Done. Total items: {final['total_items']}. Reason: {final['stop_reason']}")
+        log.info(
+            f"✅  Done. Total unique: {final['total_items']}, "
+            f"dups skipped: {final.get('duplicates_skipped', 0)}, "
+            f"reason: {final['stop_reason']}"
+        )
 
     else:
-        # Default: trending
         log.info(f"=== Starting trending scrape from page {start_page} ===")
         final = scrape_trending(start_page=start_page)
-        log.info(f"✅  Done. Total items: {final['total_items']}. Reason: {final['stop_reason']}")
+        log.info(
+            f"✅  Done. Total unique: {final['total_items']}, "
+            f"dups skipped: {final.get('duplicates_skipped', 0)}, "
+            f"reason: {final['stop_reason']}"
+        )
 
 
 if __name__ == "__main__":
